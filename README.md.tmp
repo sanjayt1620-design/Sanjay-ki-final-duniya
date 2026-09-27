@@ -1,0 +1,222 @@
+import os, datetime, requests, xml.etree.ElementTree as ET
+from urllib.parse import quote as urlquote
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+app=Flask(__name__, static_folder='web', static_url_path='')
+CORS(app)
+UPSTOX_BASE=os.getenv('UPSTOX_API_BASE','https://api.upstox.com').rstrip('/')
+UPSTOX_TOKEN=os.getenv('UPSTOX_ACCESS_TOKEN','').strip()
+PORT=int(os.getenv('PORT','8787'))
+CACHE_TTL=int(os.getenv('CACHE_TTL_SECONDS','30'))
+_cache={}
+
+def now(): return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
+def api_json(url,params=None,headers=None):
+    r=requests.get(url,params=params,headers=headers or {},timeout=20); 
+    try: data=r.json()
+    except Exception: data={'raw':r.text[:2000]}
+    if r.status_code>=400: raise RuntimeError(f'HTTP {r.status_code}: {data}')
+    return data
+
+def cached(key,fn):
+    t=datetime.datetime.now(datetime.timezone.utc).timestamp(); hit=_cache.get(key)
+    if hit and t-hit[0]<CACHE_TTL: return hit[1]
+    val=fn(); _cache[key]=(t,val); return val
+
+def up_headers():
+    if not UPSTOX_TOKEN: raise RuntimeError('UPSTOX_ACCESS_TOKEN missing')
+    return {'Accept':'application/json','Authorization':f'Bearer {UPSTOX_TOKEN}'}
+
+def find_nse_equity(symbol):
+    def f():
+        data=api_json(f'{UPSTOX_BASE}/v2/instruments/search',params={'query':symbol,'exchanges':'NSE','segments':'EQ','page_number':1,'records':20},headers=up_headers())
+        rows=data.get('data') or []; su=symbol.upper()
+        exact=[x for x in rows if str(x.get('trading_symbol','')).upper()==su and x.get('segment')=='NSE_EQ']
+        if exact:return exact[0]
+        eq=[x for x in rows if x.get('segment')=='NSE_EQ']; return eq[0] if eq else None
+    return cached('inst:'+symbol,f)
+
+def upstox_quote(symbol):
+    inst=find_nse_equity(symbol)
+    if not inst:return {'status':'not_found','symbol':symbol,'provider':'Upstox'}
+    key=inst['instrument_key']
+    def f():
+        data=api_json(f'{UPSTOX_BASE}/v3/market-quote/quotes',params={'instrument_key':key},headers=up_headers())
+        raw=(data.get('data') or {}).get(key) or {}; ltpc=raw.get('ltpc') or {}; ohlc=raw.get('ohlc') or {}
+        return {'status':'ok','provider':'Upstox','exchange':'NSE','instrument_key':key,'trading_symbol':inst.get('trading_symbol'),'name':inst.get('name'),'isin':inst.get('isin'),'last_price':ltpc.get('ltp'),'previous_close':ltpc.get('cp'),'last_trade_time':ltpc.get('ltt'),'last_trade_qty':ltpc.get('ltq'),'open':(ohlc.get('open') or {}).get('price'),'high':(ohlc.get('high') or {}).get('price'),'low':(ohlc.get('low') or {}).get('price'),'volume':(ohlc.get('volume') or raw.get('volume')),'year_high':raw.get('year_high'),'year_low':raw.get('year_low')}
+    return cached('quote:'+key,f)
+
+def google_news(symbol):
+    def f():
+        q=urlquote(f'{symbol} NSE India stock'); url=f'https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en'
+        r=requests.get(url,timeout=20,headers={'User-Agent':'PersonalStockResearch/4.0'}); r.raise_for_status(); root=ET.fromstring(r.content); items=[]
+        for item in root.findall('./channel/item')[:20]:
+            items.append({'title':item.findtext('title'),'link':item.findtext('link'),'published':item.findtext('pubDate'),'source':(item.find('source').text if item.find('source') is not None else None)})
+        return {'status':'ok','provider':'Google News RSS discovery','items':items}
+    return cached('news:'+symbol,f)
+
+def risk_engine(q,news):
+    flags=[]; facts=[]
+    if q.get('status')=='ok':
+        lp,pc=q.get('last_price'),q.get('previous_close')
+        if isinstance(lp,(int,float)) and isinstance(pc,(int,float)) and pc:
+            ch=(lp/pc-1)*100; facts.append({'check':'1-day price change','value':round(ch,2),'unit':'%'})
+            if abs(ch)>=5: flags.append({'level':'attention','check':'large 1-day move','evidence':f'{ch:.2f}% vs previous close'})
+        vol=q.get('volume')
+        if vol is not None: facts.append({'check':'volume available','value':vol})
+        yh,yl=q.get('year_high'),q.get('year_low')
+        if yh and yl and q.get('last_price'):
+            facts.append({'check':'52-week range','value':f'{yl} - {yh}'})
+    items=(news or {}).get('items') or []
+    facts.append({'check':'news items retrieved','value':len(items)})
+    return {'status':'ok','method':'rule-based evidence flags only','flags':flags,'facts':facts,'not_checked':['debt','promoter pledge','results trend','cash flow','auditor issues','legal/regulatory risk','valuation']}
+
+
+
+def up_fundamental(isin, endpoint, params=None):
+    if not isin: return {'status':'gap','reason':'ISIN not available'}
+    def f():
+        return api_json(f'{UPSTOX_BASE}/v2/fundamentals/{isin}/{endpoint}', params=params or {}, headers=up_headers())
+    return cached(f'fund:{isin}:{endpoint}:{str(params)}', f)
+
+def fundamentals_bundle(isin):
+    if not isin: return {'status':'gap','reason':'ISIN not available'}
+    out={}
+    specs={
+      'income_statement':('income-statement',{'type':'consolidated','time_period':'quarterly','fs':'true'}),
+      'income_yearly':('income-statement',{'type':'consolidated','time_period':'yearly','fs':'true'}),
+      'balance_sheet':('balance-sheet',{'type':'consolidated','fs':'true'}),
+      'cash_flow':('cash-flow',{'type':'consolidated','fs':'true'}),
+      'key_ratios':('key-ratios',{}),
+      'share_holdings':('share-holdings',{}),
+      'corporate_actions':('corporate-actions',{}),
+    }
+    for name,(ep,params) in specs.items():
+        try: out[name]=up_fundamental(isin,ep,params)
+        except Exception as e: out[name]={'status':'error','error':str(e)}
+    out['status']='ok'
+    out['provider']='Upstox Company Fundamentals API'
+    out['fetched_at']=now()
+    return out
+
+def extract_latest_history(bundle, category, container_key):
+    data=((bundle.get(container_key) or {}).get('data') or {}).get(container_key) or []
+    for row in data:
+        if row.get('category')==category and row.get('history'):
+            return row['history'][0]
+    return None
+
+def fundamental_risk(bundle):
+    flags=[]; facts=[]
+    inc=bundle.get('income_statement',{}).get('data',{}).get('income_statement',[]) if bundle.get('income_statement',{}).get('status')=='success' else []
+    rev=next((x for x in inc if x.get('category')=='revenue'),None)
+    profit=next((x for x in inc if x.get('category')=='net_profit'),None)
+    if rev and rev.get('history'):
+        h=rev['history'][0]; facts.append({'check':'latest revenue','value':h.get('value'),'period':h.get('period'),'unit':'crore'})
+        if isinstance(h.get('change'),str) and h['change'].startswith('-'):
+            flags.append({'level':'attention','check':'revenue decline','evidence':h['change']})
+    if profit and profit.get('history'):
+        h=profit['history'][0]; facts.append({'check':'latest net profit','value':h.get('value'),'period':h.get('period'),'unit':'crore'})
+        if isinstance(h.get('change'),str) and h['change'].startswith('-'):
+            flags.append({'level':'attention','check':'net profit decline','evidence':h['change']})
+    bs=bundle.get('balance_sheet',{}).get('data',{}) if bundle.get('balance_sheet',{}).get('status')=='success' else {}
+    hist=bs.get('history') or []
+    if hist: facts.append({'check':'latest total liabilities','value':hist[0].get('total_liability'),'period':hist[0].get('period'),'unit':'crore'})
+    cf=bundle.get('cash_flow',{}).get('data',{}) if bundle.get('cash_flow',{}).get('status')=='success' else {}
+    cfs=cf.get('cash_flow') or []
+    op=next((x for x in cfs if x.get('category')=='operating'),None)
+    if op and op.get('history'):
+        h=op['history'][0]; facts.append({'check':'latest operating cash flow','value':h.get('value'),'period':h.get('period'),'unit':'crore'})
+        if isinstance(h.get('value'),(int,float)) and h['value']<0: flags.append({'level':'attention','check':'negative operating cash flow','evidence':str(h.get('value'))+' crore'})
+    ratios=bundle.get('key_ratios',{}).get('data') if bundle.get('key_ratios',{}).get('status')=='success' else []
+    for r in ratios or []:
+        if r.get('name') in ('ROE','ROCE','P/E','P/B','EV/EBITDA'): facts.append({'check':r.get('name'),'value':r.get('company_value'),'sector':r.get('sector_value')})
+    sh=bundle.get('share_holdings',{}).get('data') if bundle.get('share_holdings',{}).get('status')=='success' else []
+    prom=next((x for x in sh or [] if x.get('category')=='promoters'),None)
+    if prom and prom.get('history'):
+        h=prom['history'][0]; facts.append({'check':'promoter holding','value':h.get('value'),'period':h.get('period'),'unit':'%'})
+    return {'flags':flags,'facts':facts,'method':'rule-based evidence flags; not a buy/sell recommendation'}
+
+
+def source_map(symbol):
+    return [
+      {'name':'NSE Corporate Filings','url':'https://www.nseindia.com/companies-listing/corporate-filings-application','purpose':'Announcements, actions, meetings, results, shareholding'},
+      {'name':'NSE Financial Results','url':'https://www.nseindia.com/companies-listing/corporate-filings-financial-results','purpose':'Financial results / XBRL'},
+      {'name':'NSE Shareholding Pattern','url':'https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern','purpose':'Promoter/public shareholding and related disclosures'},
+      {'name':'NSE Corporate Actions','url':'https://www.nseindia.com/companies-listing/corporate-filings-actions','purpose':'Dividends, corporate actions and meetings'},
+    ]
+
+@app.get('/')
+def index(): return app.send_static_file('index.html')
+@app.get('/api/health')
+def health(): return jsonify({'status':'ok','time':now(),'upstox_configured':bool(UPSTOX_TOKEN),'news_discovery':'google_news_rss','nse_sources':'official_links','fundamentals':'provider_required','filings':'official_source_links; authorized API required for automated ingestion'})
+@app.get('/api/instrument')
+def instrument():
+    s=request.args.get('symbol','').strip().upper()
+    if not s:return jsonify({'error':'symbol required'}),400
+    try:return jsonify({'fetched_at':now(),'data':find_nse_equity(s)})
+    except Exception as e:return jsonify({'status':'error','error':str(e)}),502
+@app.get('/api/quote')
+def quote():
+    s=request.args.get('symbol','').strip().upper()
+    if not s:return jsonify({'error':'symbol required'}),400
+    try:q=upstox_quote(s);q['fetched_at']=now();return jsonify(q)
+    except Exception as e:return jsonify({'status':'error','symbol':s,'error':str(e)}),502
+@app.get('/api/fundamentals')
+def fundamentals():
+    s=request.args.get('symbol','').strip().upper()
+    if not s:return jsonify({'error':'symbol required'}),400
+    try:
+        inst=find_nse_equity(s); isin=(inst or {}).get('isin')
+        return jsonify({'symbol':s,'isin':isin,'data':fundamentals_bundle(isin)})
+    except Exception as e:return jsonify({'status':'error','symbol':s,'error':str(e)}),502
+@app.get('/api/news')
+def news():
+    s=request.args.get('symbol','').strip().upper()
+    if not s:return jsonify({'error':'symbol required'}),400
+    try:n=google_news(s);n.update({'symbol':s,'fetched_at':now()});return jsonify(n)
+    except Exception as e:return jsonify({'status':'error','symbol':s,'error':str(e)}),502
+@app.get('/api/research')
+def research():
+    s=request.args.get('symbol','').strip().upper()
+    if not s:return jsonify({'error':'symbol required'}),400
+    out={'symbol':s,'generated_at':now(),'pipeline':{}}
+    try:out['quote']=upstox_quote(s);out['pipeline']['quote']='ok'
+    except Exception as e:out['quote']={'status':'error','error':str(e)};out['pipeline']['quote']='error'
+    try:out['news']=google_news(s);out['pipeline']['news']='ok'
+    except Exception as e:out['news']={'status':'error','error':str(e)};out['pipeline']['news']='error'
+    isin=(out.get('quote') or {}).get('isin')
+    try:
+        bundle=fundamentals_bundle(isin)
+        out['fundamentals']=bundle
+        out['ownership']=bundle.get('share_holdings',{'status':'gap'})
+        out['results']=bundle.get('income_statement',{'status':'gap'})
+        out['cash_flow']=bundle.get('cash_flow',{'status':'gap'})
+        out['balance_sheet']=bundle.get('balance_sheet',{'status':'gap'})
+        out['ratios']=bundle.get('key_ratios',{'status':'gap'})
+        out['corporate_actions']=bundle.get('corporate_actions',{'status':'gap'})
+        out['pipeline']['fundamentals']='ok' if bundle.get('status')=='ok' else 'gap'
+        out['pipeline']['ownership']='ok' if bundle.get('share_holdings',{}).get('status')=='success' else 'gap'
+        out['pipeline']['results']='ok' if bundle.get('income_statement',{}).get('status')=='success' else 'gap'
+        out['pipeline']['cash_flow']='ok' if bundle.get('cash_flow',{}).get('status')=='success' else 'gap'
+        out['fundamental_risk']=fundamental_risk(bundle)
+    except Exception as e:
+        out['fundamentals']={'status':'error','error':str(e)};out['pipeline']['fundamentals']='error'
+        out['ownership']={'status':'gap'};out['results']={'status':'gap'};out['cash_flow']={'status':'gap'};out['balance_sheet']={'status':'gap'};out['ratios']={'status':'gap'};out['corporate_actions']={'status':'gap'}
+        out['fundamental_risk']={'flags':[],'facts':[],'method':'unavailable'}
+    out['filings']={'status':'source_links_only','sources':source_map(s)};out['pipeline']['filings']='source_links'
+    out['risk_engine']=risk_engine(out.get('quote',{}),out.get('news',{}));out['risk_engine']['flags'] += out.get('fundamental_risk',{}).get('flags',[]); out['risk_engine']['facts'] += out.get('fundamental_risk',{}).get('facts',[]); out['risk_engine']['not_checked']=[x for x in out['risk_engine'].get('not_checked',[]) if x not in ['debt','promoter pledge','results trend','cash flow']]; out['pipeline']['risk']='ok'
+    return jsonify(out)
+@app.get('/api/research-batch')
+def batch():
+    raw=request.args.get('symbols',''); syms=[x.strip().upper() for x in raw.split(',') if x.strip()][:20];
+    if not syms:return jsonify({'error':'symbols required'}),400
+    rows=[]
+    for s in syms:
+        try:
+            q=upstox_quote(s); lp,pc=q.get('last_price'),q.get('previous_close'); ch=round((lp/pc-1)*100,2) if isinstance(lp,(int,float)) and isinstance(pc,(int,float)) and pc else None
+            rows.append({'symbol':s,'status':q.get('status'),'last_price':lp,'change_pct':ch,'volume':q.get('volume'),'year_high':q.get('year_high'),'year_low':q.get('year_low'),'fetched_at':now()})
+        except Exception as e:rows.append({'symbol':s,'status':'error','error':str(e)})
+    return jsonify({'generated_at':now(),'count':len(rows),'results':rows})
+if __name__=='__main__':app.run(host='127.0.0.1',port=PORT,debug=False)
