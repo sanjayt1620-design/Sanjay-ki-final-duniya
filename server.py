@@ -2,23 +2,34 @@ from multi_stock_scanner import scan as scan_stocks
 from analysis_engine import build_analysis
 from historical_anomaly import normalize_candles, analyze_candles, match_news_to_anomalies, build_intraday_timeline
 from backtesting import run_backtest
-import os, datetime, requests, xml.etree.ElementTree as ET, sqlite3, json, hashlib
+import os, datetime, requests, xml.etree.ElementTree as ET, sqlite3, json, hashlib, threading
 from datetime import timedelta
 from urllib.parse import quote as urlquote
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-app=Flask(__name__, static_folder='.',static_url_path='')
-CORS(app)
+app=Flask(__name__, static_folder='web', static_url_path='')
+cors_origins=os.getenv('CORS_ORIGINS','').strip()
+if cors_origins:
+    CORS(app, origins=[x.strip() for x in cors_origins.split(',') if x.strip()])
 UPSTOX_BASE=os.getenv('UPSTOX_API_BASE','https://api.upstox.com').rstrip('/')
-UPSTOX_TOKEN=os.getenv('UPSTOX_ACCESS_TOKEN','').strip()
 PORT=int(os.getenv('PORT','8787'))
 CACHE_TTL=int(os.getenv('CACHE_TTL_SECONDS','30'))
 _cache={}
+_cache_lock=threading.RLock()
+_db_lock=threading.RLock()
 DB_PATH=os.getenv('RESEARCH_DB_PATH', os.path.join(os.path.dirname(__file__), 'research_history.sqlite3'))
 
+def db_connect():
+    con=sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+    con.execute('PRAGMA busy_timeout=15000')
+    try: con.execute('PRAGMA journal_mode=WAL')
+    except sqlite3.DatabaseError: pass
+    con.execute('PRAGMA synchronous=NORMAL')
+    return con
+
 def db_init():
-    con=sqlite3.connect(DB_PATH)
+    con=db_connect()
     con.execute("CREATE TABLE IF NOT EXISTS research_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, generated_at TEXT, symbols TEXT, payload TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS research_events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, symbol TEXT, event_type TEXT, timestamp TEXT, move_pct REAL, volume_ratio REAL, flags TEXT, news_count INTEGER, payload TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS evidence_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, finding_type TEXT, summary TEXT, source_name TEXT, source_url TEXT, source_type TEXT, observed_at TEXT, published_at TEXT, data_asof TEXT, fingerprint TEXT, status TEXT)")
@@ -26,17 +37,25 @@ def db_init():
     con.execute("CREATE TABLE IF NOT EXISTS contradictions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, topic TEXT, left_summary TEXT, left_source TEXT, right_summary TEXT, right_source TEXT, detected_at TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS monitoring_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, fingerprint TEXT, alert_type TEXT, summary TEXT, created_at TEXT, payload TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS saved_moments (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, saved_at TEXT, title TEXT, trigger TEXT, summary TEXT, payload TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_research_runs_generated ON research_runs(generated_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_research_events_symbol_id ON research_events(symbol,id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_evidence_symbol_id ON evidence_ledger(symbol,id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_id ON research_snapshots(symbol,id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_alerts_symbol_id ON monitoring_alerts(symbol,id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_moments_symbol_id ON saved_moments(symbol,id)")
     con.commit(); con.close()
 
 def db_save_run(payload):
-    db_init(); con=sqlite3.connect(DB_PATH)
-    cur=con.execute("INSERT INTO research_runs(generated_at,symbols,payload) VALUES(?,?,?)", (payload.get('generated_at'), ','.join(x.get('symbol','') for x in payload.get('rows',[])), json.dumps(payload)))
-    rid=cur.lastrowid
-    for row in payload.get('rows',[]):
-        i=row.get('intraday') or {}; latest=i.get('latest') or {}
-        if latest:
-            con.execute("INSERT INTO research_events(run_id,symbol,event_type,timestamp,move_pct,volume_ratio,flags,news_count,payload) VALUES(?,?,?,?,?,?,?,?,?)",(rid,row.get('symbol'),'price_volume_anomaly',latest.get('timestamp'),latest.get('return_pct'),latest.get('volume_ratio'),json.dumps(latest.get('flags',[])),i.get('events_with_news',0),json.dumps(latest)))
-    con.commit(); con.close(); return rid
+    with _db_lock:
+        db_init(); con=db_connect()
+        cur=con.execute("INSERT INTO research_runs(generated_at,symbols,payload) VALUES(?,?,?)", (payload.get('generated_at'), ','.join(x.get('symbol','') for x in payload.get('rows',[])), json.dumps(payload)))
+        rid=cur.lastrowid
+        for row in payload.get('rows',[]):
+            i=row.get('intraday') or {}; latest=i.get('latest') or {}
+            if latest:
+                con.execute("INSERT INTO research_events(run_id,symbol,event_type,timestamp,move_pct,volume_ratio,flags,news_count,payload) VALUES(?,?,?,?,?,?,?,?,?)",(rid,row.get('symbol'),'price_volume_anomaly',latest.get('timestamp'),latest.get('return_pct'),latest.get('volume_ratio'),json.dumps(latest.get('flags',[])),i.get('events_with_news',0),json.dumps(latest)))
+        con.commit(); con.close(); return rid
+
 
 db_init()
 
@@ -52,11 +71,11 @@ def evidence_fingerprint(summary, source_url=''):
     return hashlib.sha256((str(summary)+'|'+str(source_url)).encode()).hexdigest()[:24]
 
 def record_evidence(symbol, finding_type, summary, source_name='', source_url='', published_at=None, data_asof=None, status='observed'):
-    db_init(); con=sqlite3.connect(DB_PATH); fp=evidence_fingerprint(summary,source_url)
+    db_init(); con=db_connect(); fp=evidence_fingerprint(summary,source_url)
     con.execute("INSERT INTO evidence_ledger(symbol,finding_type,summary,source_name,source_url,source_type,observed_at,published_at,data_asof,fingerprint,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(symbol,finding_type,summary,source_name,source_url,source_type(source_url),now(),published_at,data_asof,fp,status)); con.commit(); con.close(); return fp
 
 def snapshot_diff(symbol, payload):
-    db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    db_init(); con=db_connect(); con.row_factory=sqlite3.Row
     compact=json.dumps({'quote':payload.get('quote'), 'risk':payload.get('risk_engine'), 'news_count':len((payload.get('news') or {}).get('items') or [])},sort_keys=True,default=str)
     fp=hashlib.sha256(compact.encode()).hexdigest()
     prev=con.execute("SELECT fingerprint,summary,generated_at FROM research_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 1",(symbol,)).fetchone()
@@ -85,8 +104,9 @@ def cached(key,fn):
     val=fn(); _cache[key]=(t,val); return val
 
 def up_headers():
-    if not UPSTOX_TOKEN: raise RuntimeError('UPSTOX_ACCESS_TOKEN missing')
-    return {'Accept':'application/json','Authorization':f'Bearer {UPSTOX_TOKEN}'}
+    token=os.getenv('UPSTOX_ACCESS_TOKEN','').strip()
+    if not token: raise RuntimeError('UPSTOX_ACCESS_TOKEN missing')
+    return {'Accept':'application/json','Authorization':f'Bearer {token}'}
 
 def find_nse_equity(symbol):
     def f():
@@ -190,10 +210,17 @@ def fundamentals_bundle(isin):
       'share_holdings':('share-holdings',{}),
       'corporate_actions':('corporate-actions',{}),
     }
+    successes=0; failures=[]
     for name,(ep,params) in specs.items():
-        try: out[name]=up_fundamental(isin,ep,params)
-        except Exception as e: out[name]={'status':'error','error':str(e)}
-    out['status']='ok'
+        try:
+            out[name]=up_fundamental(isin,ep,params)
+            if (out[name] or {}).get('status')=='success': successes+=1
+            else: failures.append(name)
+        except Exception as e:
+            out[name]={'status':'error','error':str(e)}; failures.append(name)
+    out['status']='ok' if successes==len(specs) else ('partial' if successes else 'gap')
+    out['successful_endpoints']=successes
+    out['failed_endpoints']=failures
     out['provider']='Upstox Company Fundamentals API'
     out['fetched_at']=now()
     return out
@@ -452,7 +479,7 @@ def intraday_live(symbol, unit='minutes', interval='5'):
     return {'status':'success','provider':'Upstox Intraday Candle V3','symbol':symbol,'instrument_key':key,'unit':unit,'interval':interval,'candles':candles,'fetched_at':now()}
 
 def event_similarity(symbol, move_pct, volume_ratio, flags):
-    db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    db_init(); con=db_connect(); con.row_factory=sqlite3.Row
     rows=[dict(r) for r in con.execute("SELECT symbol,timestamp,move_pct,volume_ratio,flags,news_count FROM research_events WHERE symbol=? ORDER BY id DESC LIMIT 200",(symbol,)).fetchall()]
     con.close()
     def dist(r):
@@ -546,7 +573,7 @@ def build_full_research(symbol, include_backtest=True):
         return {'status':'error','symbol':s,'error':str(e),'generated_at':now(),'stages':out.get('stages',{})}
 
 def monitor_symbols(symbols):
-    db_init(); rows=[]; alerts=[]; con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    db_init(); rows=[]; alerts=[]; con=db_connect(); con.row_factory=sqlite3.Row
     threshold=float(os.getenv('MOVEMENT_ALERT_PCT','1.0'))
     for s in symbols[:20]:
         try:
@@ -575,10 +602,34 @@ def monitor_symbols(symbols):
         except Exception as e: rows.append({'symbol':s,'status':'error','error':str(e),'new_alert':False})
     con.commit(); con.close(); return {'status':'success','generated_at':now(),'rows':rows,'new_alerts':alerts,'movement_threshold_pct':threshold,'note':'Monitoring detects observed changes; it does not infer causation or produce buy/sell signals.'}
 
+@app.after_request
+def response_headers(resp):
+    if request.path.startswith('/api/') or request.path in ('/','/sw.js','/manifest.json'):
+        resp.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
+        resp.headers['Pragma']='no-cache'
+        resp.headers['Expires']='0'
+    return resp
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc):
+    if request.path.startswith('/api/'):
+        return jsonify({'status':'error','error':'Internal server error','detail':str(exc)}),500
+    return 'Internal server error', 500
+
 @app.get('/')
 def index(): return app.send_static_file('index.html')
 @app.get('/api/health')
-def health(): return jsonify({'status':'ok','time':now(),'upstox_configured':bool(UPSTOX_TOKEN),'news_discovery':'google_news_rss','nse_sources':'official_links','fundamentals':'upstox_company_fundamentals','filings':'official_source_links; authorized API required for automated ingestion'})
+def health():
+    db_status='ok'
+    db_error=None
+    try:
+        db_init(); con=db_connect(); con.execute('SELECT 1').fetchone(); con.close()
+    except Exception as e:
+        db_status='error'; db_error=str(e)
+    status='ok' if db_status=='ok' else 'degraded'
+    payload={'status':status,'time':now(),'upstox_configured':bool(os.getenv('UPSTOX_ACCESS_TOKEN','').strip()),'database':db_status,'news_discovery':'google_news_rss','nse_sources':'official_links','fundamentals':'upstox_company_fundamentals','filings':'official_source_links; authorized API required for automated ingestion'}
+    if db_error: payload['database_error']=db_error
+    return jsonify(payload), (200 if status=='ok' else 503)
 @app.get('/api/instrument')
 def instrument():
     s=request.args.get('symbol','').strip().upper()
@@ -859,7 +910,7 @@ def monitor_api():
 
 @app.get('/api/monitor-alerts')
 def monitor_alerts_api():
-    db_init(); limit=min(max(int(request.args.get('limit','50')),1),200); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    db_init(); limit=min(max(int(request.args.get('limit','50')),1),200); con=db_connect(); con.row_factory=sqlite3.Row
     rows=[dict(r) for r in con.execute('SELECT * FROM monitoring_alerts ORDER BY id DESC LIMIT ?',(limit,)).fetchall()]; con.close(); return jsonify({'status':'success','alerts':rows})
 
 @app.get('/api/research-dossier')
@@ -873,7 +924,7 @@ def research_dossier_api():
 
 @app.get('/api/monitor-alerts-summary')
 def monitor_alerts_summary_api():
-    db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    db_init(); con=db_connect(); con.row_factory=sqlite3.Row
     total=con.execute('SELECT COUNT(*) c FROM monitoring_alerts').fetchone()['c']
     recent=[dict(r) for r in con.execute('SELECT * FROM monitoring_alerts ORDER BY id DESC LIMIT 20').fetchall()]
     con.close(); return jsonify({'status':'success','total':total,'recent':recent,'generated_at':now()})
@@ -903,14 +954,14 @@ def save_moment_api():
 @app.get('/api/saved-moments')
 def saved_moments_api():
     db_init(); limit=min(max(int(request.args.get('limit','50')),1),200); symbol=request.args.get('symbol','').strip().upper()
-    con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    con=db_connect(); con.row_factory=sqlite3.Row
     if symbol: rows=[dict(r) for r in con.execute('SELECT * FROM saved_moments WHERE symbol=? ORDER BY id DESC LIMIT ?',(symbol,limit)).fetchall()]
     else: rows=[dict(r) for r in con.execute('SELECT * FROM saved_moments ORDER BY id DESC LIMIT ?',(limit,)).fetchall()]
     con.close(); return jsonify({'status':'success','moments':rows})
 
 @app.get('/api/research-history')
 def research_history_api():
-    db_init(); limit=min(max(int(request.args.get('limit','20')),1),100); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    db_init(); limit=min(max(int(request.args.get('limit','20')),1),100); con=db_connect(); con.row_factory=sqlite3.Row
     rows=[dict(r) for r in con.execute("SELECT id,generated_at,symbols,payload FROM research_runs ORDER BY id DESC LIMIT ?",(limit,)).fetchall()]; con.close()
     for r in rows:
         try: p=json.loads(r['payload']); r['count']=p.get('count'); r['deep_researched']=p.get('deep_researched')
@@ -919,7 +970,7 @@ def research_history_api():
 
 @app.get('/api/similar-events')
 def similar_events_api():
-    symbol=request.args.get('symbol','').strip().upper(); db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    symbol=request.args.get('symbol','').strip().upper(); db_init(); con=db_connect(); con.row_factory=sqlite3.Row
     if symbol:
         rows=[dict(r) for r in con.execute("SELECT symbol,event_type,timestamp,move_pct,volume_ratio,flags,news_count FROM research_events WHERE symbol=? ORDER BY id DESC LIMIT 50",(symbol,)).fetchall()]
     else:
@@ -966,7 +1017,7 @@ def event_similarity_api():
 def v17_evidence_api():
     s=request.args.get('symbol','').strip().upper()
     if not s:return jsonify({'error':'symbol required'}),400
-    limit=min(max(int(request.args.get('limit','50')),1),200); db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    limit=min(max(int(request.args.get('limit','50')),1),200); db_init(); con=db_connect(); con.row_factory=sqlite3.Row
     rows=[dict(r) for r in con.execute("SELECT * FROM evidence_ledger WHERE symbol=? ORDER BY id DESC LIMIT ?",(s,limit)).fetchall()]; con.close()
     return jsonify({'status':'success','symbol':s,'evidence':rows,'count':len(rows)})
 
@@ -977,7 +1028,7 @@ def v17_dossier_api():
     q=upstox_quote(s); n=google_news(s); bundle=fundamentals_bundle((q or {}).get('isin')); deep=deep_analysis(s,bundle,n); risk=risk_engine(q,n)
     payload={'status':'success','symbol':s,'generated_at':now(),'quote':q,'news':n,'fundamentals':bundle,'deep_analysis':deep,'risk_engine':risk}
     build_v17_evidence(s,payload); diff=snapshot_diff(s,payload)
-    db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row
+    db_init(); con=db_connect(); con.row_factory=sqlite3.Row
     ev=[dict(r) for r in con.execute("SELECT * FROM evidence_ledger WHERE symbol=? ORDER BY id DESC LIMIT 100",(s,)).fetchall()]; con.close()
     gaps=deep.get('gaps') or []; quality='complete' if ev and not gaps else ('partial' if ev else 'data-gap')
     return jsonify({'status':'success','symbol':s,'quality':quality,'change':diff,'evidence':ev,'research':payload,'generated_at':now()})
@@ -986,14 +1037,14 @@ def v17_dossier_api():
 def v17_change_api():
     s=request.args.get('symbol','').strip().upper()
     if not s:return jsonify({'error':'symbol required'}),400
-    db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row; rows=[dict(r) for r in con.execute("SELECT id,generated_at,summary FROM research_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 10",(s,)).fetchall()]; con.close()
+    db_init(); con=db_connect(); con.row_factory=sqlite3.Row; rows=[dict(r) for r in con.execute("SELECT id,generated_at,summary FROM research_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 10",(s,)).fetchall()]; con.close()
     return jsonify({'status':'success','symbol':s,'snapshots':rows})
 
 @app.get('/api/v17-replay')
 def v17_replay_api():
     s=request.args.get('symbol','').strip().upper(); event_id=request.args.get('event_id')
     if not s:return jsonify({'error':'symbol required'}),400
-    db_init(); con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row; row=con.execute("SELECT * FROM research_events WHERE symbol=? AND (? IS NULL OR id=?) ORDER BY id DESC LIMIT 1",(s,event_id,event_id)).fetchone(); con.close()
+    db_init(); con=db_connect(); con.row_factory=sqlite3.Row; row=con.execute("SELECT * FROM research_events WHERE symbol=? AND (? IS NULL OR id=?) ORDER BY id DESC LIMIT 1",(s,event_id,event_id)).fetchone(); con.close()
     if not row:return jsonify({'status':'gap','error':'stored event not found'})
     x=dict(row); news=google_news(s); hist=historical_anomaly_bundle(s,news); return jsonify({'status':'success','symbol':s,'event':x,'replay':hist,'news':news,'method':'descriptive event replay; no causation inference'})
 
